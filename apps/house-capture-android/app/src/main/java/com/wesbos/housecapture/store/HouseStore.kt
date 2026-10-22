@@ -1,9 +1,11 @@
 package com.wesbos.housecapture.store
 
 import android.content.Context
+import com.wesbos.housecapture.bundle.RoomReports
 import com.wesbos.housecapture.bundle.ScanBundle
 import com.wesbos.housecapture.bundle.ZipShare
 import com.wesbos.housecapture.capture.RoomLibrary
+import com.wesbos.housecapture.capture.RoomReport
 import com.wesbos.housecapture.capture.RoomSummary
 import java.io.File
 
@@ -12,6 +14,13 @@ class HouseStore(context: Context) : RoomLibrary {
     private val context = context.applicationContext
 
     override fun list(): List<RoomSummary> = ScanBundle.all(context).mapNotNull { it.summary() }
+
+    override fun report(sessionId: String): RoomReport? {
+        val bundle = bundle(sessionId)
+        if (!bundle.dir.isDirectory) return null
+        val summary = bundle.summary() ?: return null
+        return RoomReports.read(bundle, summary)
+    }
 
     override fun delete(sessionId: String) {
         bundle(sessionId).dir.deleteRecursively()

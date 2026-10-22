@@ -128,8 +128,10 @@ Pausing the app mid-scan starts a new recording segment (`segment` on each photo
 record, `capture.segments`, pause/resume in `capture.events`). ARCore may relocalize after a
 resume, so segments might not share a world frame; the scripts use all segments together. If walls
 come out doubled and `capture.segments > 1`, compare segments and drop the misaligned records
-before synthesizing. The app keeps a depth frame only when its depth image was computed for that
-camera frame (`arcore.depthTimestamp == timestamp`); this pairing is unverified on a device.
+before synthesizing. Each depth frame's `timestamp` and `transform` are those of the camera frame its depth was
+computed for: `arcore.poseSource` is `exact` when that frame was found, or `nearest` (within 50 ms,
+offset in `arcore.poseOffsetMs`). `rgb`/`rgbIntrinsics` are present only when the depth belongs to the
+current camera frame. This pairing is unverified on a device.
 Photos are the largest ARCore CPU image (expected 1920×1080; see `manifest.capture.cameraConfig`)
 with EXIF 6 and the same upright rule as iOS. Depth frames carry an extra `arcore` object with the
 raw texture intrinsics; the scripts ignore it.

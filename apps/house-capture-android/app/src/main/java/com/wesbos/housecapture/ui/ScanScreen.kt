@@ -1,6 +1,8 @@
 package com.wesbos.housecapture.ui
 
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +35,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -47,6 +50,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -62,6 +66,7 @@ import com.wesbos.housecapture.capture.RoomSummary
 import com.wesbos.housecapture.ui.theme.Fieldwork
 import com.wesbos.housecapture.ui.theme.FieldworkButton
 import com.wesbos.housecapture.ui.theme.FieldworkTheme
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 /**
@@ -178,40 +183,67 @@ fun ScanContent(
     onBack: () -> Unit,
 ) {
     val scanning = state.phase == Phase.SCANNING
+
+    // A tick and a flash of the photo counter for every saved photo.
+    val view = LocalView.current
+    var flash by remember { mutableStateOf(false) }
+    var lastPhotos by remember { mutableIntStateOf(state.photos) }
+    LaunchedEffect(state.photos) {
+        if (state.photos > lastPhotos) {
+            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            flash = true
+            delay(300)
+            flash = false
+        }
+        lastPhotos = state.photos
+    }
+
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         preview()
 
-        Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
+        Column(
+            Modifier.fillMaxSize().systemBarsPadding().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             Row(verticalAlignment = Alignment.Top) {
                 IconButton(
                     onClick = onBack,
-                    colors = IconButtonDefaults.iconButtonColors(containerColor = Fieldwork.paper.copy(alpha = 0.9f), contentColor = Fieldwork.ink),
+                    colors = IconButtonDefaults.iconButtonColors(containerColor = Fieldwork.panel, contentColor = Fieldwork.onPanel),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.back))
                 }
                 Spacer(Modifier.width(8.dp))
-                StatusBanner(state, name, Modifier.weight(1f))
+                StatusPanel(state, name, Modifier.weight(1f))
+            }
+            if (state.phase == Phase.SCANNING || state.phase == Phase.STARTING) {
+                Counters(state, flash)
+                DepthWarning(state)
             }
 
             Spacer(Modifier.weight(1f))
 
             Row(verticalAlignment = Alignment.Bottom) {
                 Surface(
-                    color = Fieldwork.paper.copy(alpha = 0.92f),
+                    color = Fieldwork.paper,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.size(120.dp),
+                    border = BorderStroke(2.dp, Fieldwork.panel),
+                    modifier = Modifier.size(176.dp),
                 ) {
                     PlanCanvas(state.snapshot, Modifier.fillMaxSize())
                 }
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                Column(
+                    Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     Shutter(enabled = scanning && state.tracking == "normal", onClick = onPhoto)
+                    FieldworkButton(
+                        text = stringResource(R.string.finish_room),
+                        onClick = onFinish,
+                        enabled = scanning,
+                        modifier = Modifier.padding(start = 12.dp),
+                    )
                 }
-                FieldworkButton(
-                    text = stringResource(R.string.finish_room),
-                    onClick = onFinish,
-                    enabled = scanning,
-                    modifier = Modifier.width(120.dp),
-                )
             }
         }
 
@@ -230,39 +262,86 @@ fun ScanContent(
     }
 }
 
+/** Solid ink panel: tracking state in large type, then the one thing to do next. */
 @Composable
-private fun StatusBanner(state: CaptureState, name: String, modifier: Modifier = Modifier) {
-    val warning = state.trackingWarning ?: state.error
-    Surface(
-        color = if (warning != null) Fieldwork.orange else Fieldwork.paper.copy(alpha = 0.92f),
-        contentColor = if (warning != null) Color.White else Fieldwork.ink,
-        shape = RoundedCornerShape(12.dp),
-        modifier = modifier,
-    ) {
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+private fun StatusPanel(state: CaptureState, name: String, modifier: Modifier = Modifier) {
+    val starting = state.phase == Phase.IDLE || state.phase == Phase.STARTING
+    val ok = !starting && state.tracking == "normal"
+    val hint = ScanGuide.hint(state)
+    val (label, dot) = when {
+        starting -> stringResource(R.string.status_starting) to Fieldwork.onPanelMuted
+        ok -> stringResource(R.string.status_tracking) to Fieldwork.good
+        state.tracking == "notAvailable" -> stringResource(R.string.status_lost) to Fieldwork.alert
+        else -> stringResource(R.string.status_limited) to Fieldwork.orange
+    }
+    Surface(color = Fieldwork.panel, contentColor = Fieldwork.onPanel, shape = RoundedCornerShape(12.dp), modifier = modifier) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                Text(elapsed(state.elapsedSeconds), style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace)
+                Box(Modifier.size(14.dp).background(dot, CircleShape))
+                Spacer(Modifier.width(8.dp))
+                Text(label, fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(elapsed(state.elapsedSeconds), fontSize = 18.sp, fontFamily = FontFamily.Monospace, color = Fieldwork.onPanelMuted)
             }
-            if (warning != null) {
-                Text(warning, style = MaterialTheme.typography.bodySmall)
-            } else if (state.phase == Phase.IDLE || state.phase == Phase.STARTING) {
-                // The preview stays visible while ARCore initialises: it needs the user to move.
-                Text(stringResource(R.string.starting_camera), style = MaterialTheme.typography.bodySmall)
-            } else {
-                val detail = state.coverage?.let { stringResource(R.string.photo_detail_percent, (it * 100).roundToInt()) }
-                    ?: stringResource(R.string.photo_detail_pending)
-                Text(detail, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
-                Text(
-                    stringResource(R.string.scan_counts, state.photos, state.manualPhotos, state.depthFrames, state.planes),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = Fieldwork.secondary,
-                )
-                if (state.phase == Phase.SCANNING && !state.depthAvailable) {
-                    Text(stringResource(R.string.depth_unavailable), style = MaterialTheme.typography.labelSmall, color = Fieldwork.orange)
-                }
-            }
+            Text(
+                hint.text,
+                fontSize = 18.sp,
+                lineHeight = 23.sp,
+                fontWeight = if (hint.urgent) FontWeight.Bold else FontWeight.Medium,
+                color = if (hint.urgent) Color(0xFFFFB59A) else Fieldwork.onPanel,
+            )
+            Text(name, fontSize = 13.sp, color = Fieldwork.onPanelMuted)
+        }
+    }
+}
+
+/** Photos, depth frames and photo detail as large numbers; depth turns red when it is stalled. */
+@Composable
+private fun Counters(state: CaptureState, flash: Boolean) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Counter(
+            stringResource(R.string.counter_photos),
+            state.photos.toString(),
+            Modifier.weight(1f),
+            background = if (flash) Fieldwork.good else Fieldwork.panel,
+        )
+        Counter(
+            stringResource(R.string.counter_depth),
+            if (state.depthAvailable) state.depthFrames.toString() else "—",
+            Modifier.weight(1f),
+            background = if (state.depthStalled || (state.phase == Phase.SCANNING && !state.depthAvailable)) Fieldwork.alert else Fieldwork.panel,
+        )
+        Counter(
+            stringResource(R.string.counter_coverage),
+            state.coverage?.let { stringResource(R.string.percent, (it * 100).roundToInt()) } ?: "—",
+            Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun Counter(label: String, value: String, modifier: Modifier = Modifier, background: Color = Fieldwork.panel) {
+    Surface(color = background, contentColor = Fieldwork.onPanel, shape = RoundedCornerShape(12.dp), modifier = modifier) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(value, fontSize = 28.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, maxLines = 1)
+            Text(label.uppercase(), fontSize = 11.sp, letterSpacing = 1.5.sp, color = Fieldwork.onPanel.copy(alpha = 0.8f), maxLines = 1)
+        }
+    }
+}
+
+/** Red banner while depth is missing, with ARCore's most frequent reason in plain words. */
+@Composable
+private fun DepthWarning(state: CaptureState) {
+    val text = when {
+        state.phase != Phase.SCANNING -> null
+        !state.depthAvailable -> stringResource(R.string.depth_unavailable)
+        state.depthStalled && state.depthFrames == 0 -> stringResource(R.string.depth_none_yet)
+        state.depthStalled -> stringResource(R.string.depth_stalled)
+        else -> null
+    } ?: return
+    Surface(color = Fieldwork.alert, contentColor = Color.White, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text(text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            state.depthProblem?.let { Text(it, fontSize = 14.sp) }
         }
     }
 }
@@ -326,6 +405,14 @@ private fun ScanPreview() {
 private fun ScanLimitedPreview() {
     FieldworkTheme {
         ScanContent(PreviewData.limited, "Kitchen", preview = { Box(Modifier.fillMaxSize().background(Color.DarkGray)) }, onPhoto = {}, onFinish = {}, onBack = {})
+    }
+}
+
+@Preview(widthDp = 390, heightDp = 844)
+@Composable
+private fun ScanDepthStalledPreview() {
+    FieldworkTheme {
+        ScanContent(PreviewData.depthStalled, "Office", preview = { Box(Modifier.fillMaxSize().background(Color.DarkGray)) }, onPhoto = {}, onFinish = {}, onBack = {})
     }
 }
 

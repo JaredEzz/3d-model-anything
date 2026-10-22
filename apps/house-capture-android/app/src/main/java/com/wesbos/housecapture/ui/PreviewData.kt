@@ -7,6 +7,7 @@ import com.wesbos.housecapture.capture.CaptureContract
 import com.wesbos.housecapture.capture.CaptureState
 import com.wesbos.housecapture.capture.CoverageSnapshot
 import com.wesbos.housecapture.capture.Phase
+import com.wesbos.housecapture.capture.RoomReport
 import com.wesbos.housecapture.capture.RoomSummary
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -60,6 +61,39 @@ internal object PreviewData {
         RoomSummary("2026-10-22 17.20.45", 0, "Kitchen", "/data/user/0/com.wesbos.housecapture/files/Houses/Android/sessions/2026-10-22 17.20.45", 41, 96, 4, null, 74_000_000),
     )
 
+    /** The 4 × 3 m room as a saved report: four walls, photos in a ring. */
+    val report: RoomReport by lazy {
+        RoomReport(
+            summary = rooms[0],
+            walls = listOf(
+                floatArrayOf(-2f, -1.5f, 2f, -1.5f),
+                floatArrayOf(2f, -1.5f, 2f, 1.5f),
+                floatArrayOf(2f, 1.5f, -2f, 1.5f),
+                floatArrayOf(-2f, 1.5f, -2f, -1.5f),
+            ),
+            wallConfidence = listOf("medium", "medium", "medium", "low"),
+            photoPositions = snapshot.photoPositions,
+            floor = floatArrayOf(-2f, -1.5f, 2f, -1.5f, 2f, 1.5f, -2f, 1.5f),
+            seconds = 95.0,
+            trackingLostSeconds = 3.2,
+            depthMode = "RAW_DEPTH_ONLY",
+            depthStats = mapOf("written" to 212, "stale" to 640, "pose:exact" to 205, "pose:nearest" to 7),
+            synthesized = false,
+            finished = true,
+        )
+    }
+
+    /** What the first Pixel 10 Pro scan looked like: photos but no depth. */
+    val poorReport: RoomReport by lazy {
+        report.copy(
+            summary = rooms[1].copy(depthFrames = 0),
+            walls = report.walls.take(2),
+            depthStats = mapOf("noPose" to 180, "acquire:NotYetAvailableException" to 12),
+            trackingLostSeconds = 0.4,
+            seconds = 61.2,
+        )
+    }
+
     val scanning = CaptureState(
         phase = Phase.SCANNING,
         tracking = "normal",
@@ -73,9 +107,16 @@ internal object PreviewData {
         snapshot = snapshot,
     )
 
+    val depthStalled = scanning.copy(
+        depthFrames = 0,
+        depthStalled = true,
+        depthProblem = "Depth timestamps don't match any camera frame",
+        coverage = null,
+    )
+
     val limited = scanning.copy(
         tracking = "limited:INSUFFICIENT_FEATURES",
-        trackingWarning = "Aim at something with more detail",
+        trackingWarning = "Point at something with texture (not a blank wall)",
     )
 }
 

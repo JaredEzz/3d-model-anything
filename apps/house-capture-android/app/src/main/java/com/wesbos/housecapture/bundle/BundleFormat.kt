@@ -70,6 +70,8 @@ data class CaptureInfo(
     val depthHeight: Int? = null,
     /** "RAW_DEPTH_ONLY" or "DISABLED" */
     val depthMode: String,
+    /** every outcome of trying to record a depth frame (see DepthStats), so zero depth is explained */
+    val depthStats: DepthStatsInfo? = null,
     val depthWidth: Int? = null,
     val engine: String = "ARCore",
     /** pauses, resumes and tracking changes while recording (capped) */
@@ -84,6 +86,18 @@ data class CaptureInfo(
     val synthesized: Boolean = false,
     /** worst PowerManager thermal status seen while recording */
     val thermal: String? = null,
+    /** recorded seconds while ARCore tracking was not normal */
+    val trackingLostSeconds: Double? = null,
+)
+
+@Serializable
+data class DepthStatsInfo(
+    /** recorded seconds when the first depth frame was written */
+    val firstWrittenSeconds: Double? = null,
+    /** depth timestamp minus the nearest camera frame's, for the last depth image with no pose (ms) */
+    val lastUnmatchedOffsetMs: Double? = null,
+    /** outcome → count: "written", "stale", "noPose", "acquire:<Exception>", "pose:exact", … */
+    val outcomes: Map<String, Int> = emptyMap(),
 )
 
 @Serializable
@@ -195,8 +209,14 @@ data class DepthFrameRecord(
 
 @Serializable
 data class ArcoreDepthInfo(
-    /** the depth image's own timestamp (seconds); differs from the frame's when ARCore reprojected */
+    /** the depth image's own timestamp (seconds); the record's pose is the camera frame's at this time */
     val depthTimestamp: Double,
+    /** timestamp of the camera frame being processed when the depth was read (seconds) */
+    val frameTimestamp: Double? = null,
+    /** "nearest" only: depth timestamp minus the paired pose's frame timestamp (ms) */
+    val poseOffsetMs: Double? = null,
+    /** "exact": the pose of the frame with the depth's timestamp; "nearest": the closest frame within 50 ms */
+    val poseSource: String? = null,
     val textureHeight: Int,
     val textureIntrinsics: List<Float>,
     val textureWidth: Int,

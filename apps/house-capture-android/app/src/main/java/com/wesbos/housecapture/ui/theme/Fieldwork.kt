@@ -30,6 +30,13 @@ object Fieldwork {
     val orange = Color(0xFFC2471F)
     val rule = Color(0xFFCFC9BF)
 
+    // Scan overlays: solid ink panels with white text stay legible over any camera image.
+    val panel = ink
+    val onPanel = Color.White
+    val onPanelMuted = Color(0xFFBDB8AE)
+    val good = Color(0xFF4CAF5E)
+    val alert = Color(0xFFD32F2F)
+
     // Plan canvas colours, matching the meaning of the iPhone preview.
     val seen = Color(0xFFB4ADA1)
     val photographed = Color(0xFF3F8F4E)

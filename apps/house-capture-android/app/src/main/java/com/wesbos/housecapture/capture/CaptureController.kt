@@ -21,6 +21,7 @@ import com.wesbos.housecapture.bundle.CameraState
 import com.wesbos.housecapture.bundle.CaptureEvent
 import com.wesbos.housecapture.bundle.CaptureInfo
 import com.wesbos.housecapture.bundle.DepthFrameRecord
+import com.wesbos.housecapture.bundle.DepthStatsInfo
 import com.wesbos.housecapture.bundle.Manifest
 import com.wesbos.housecapture.bundle.Matrices
 import com.wesbos.housecapture.bundle.PhotoRecord
@@ -105,6 +106,9 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
         /** pose of the last photo the writer accepted (auto-photo spacing) */
         @Volatile var lastAcceptedPhotoPose: FloatArray? = null
         @Volatile var topDown: Pair<FloatArray, FloatArray>? = null
+        val depthStats = DepthStats()
+        /** recorded seconds while tracking was not normal */
+        @Volatile var trackingLostSeconds = 0.0
 
         // GL thread only
         var hadFrames = false
@@ -116,6 +120,14 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
         var lastPhotoAttemptNanos = Long.MIN_VALUE / 2
         var lastDepthNanos = Long.MIN_VALUE / 2
         var lastDepthPose: FloatArray? = null
+        /** poses of recent tracked frames by timestamp: depth images belong to an earlier frame */
+        val poseRing = PoseRing()
+        /** timestamp of the last raw depth image looked at; an equal one is reprojected, not new */
+        var lastDepthImageNanos: Long? = null
+        /** seconds of normal tracking since the last written depth frame (or the start) */
+        var trackedSinceDepth = 0.0
+        var depthCountSeen = 0
+        var lastDepthLogNanos = 0L
         var nextDepth = 0
         var lastSnapshotNanos = Long.MIN_VALUE / 2
         var lastCheckpointNanos = 0L
@@ -253,10 +265,25 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
                 rec.lastPose = null
                 rec.lastDepthPose = null
                 rec.lastAcceptedPhotoPose = null
+                rec.poseRing.clear()
+                rec.lastDepthImageNanos = null
             }
             // recorded time only: frame gaps over half a second (paused, backgrounded) don't count
             val dt = (now - rec.lastFrameNanos) / 1e9
-            if (rec.lastFrameNanos != 0L && dt > 0 && dt < 0.5) rec.elapsedSeconds += dt
+            if (rec.lastFrameNanos != 0L && dt > 0 && dt < 0.5) {
+                rec.elapsedSeconds += dt
+                if (camera.trackingState != TrackingState.TRACKING) rec.trackingLostSeconds += dt
+                else rec.trackedSinceDepth += dt
+            }
+            val written = rec.depthCount.get()
+            if (written != rec.depthCountSeen) {
+                rec.depthCountSeen = written
+                rec.trackedSinceDepth = 0.0
+            }
+            if (now - rec.lastDepthLogNanos >= SECOND && info?.depthEnabled == true) {
+                rec.lastDepthLogNanos = now
+                Log.i(TAG, "depth @${"%.1f".format(Locale.ROOT, rec.elapsedSeconds)}s: ${rec.depthStats.summary()}")
+            }
             rec.lastFrameNanos = now
             rec.hadFrames = true
             if (tracking.first != rec.lastTracking) {
@@ -274,6 +301,7 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
         }
 
         val pose = poseMatrix(camera.pose)
+        rec.poseRing.add(now, pose)
         updateMotion(rec, pose, now)
         considerDepth(rec, frame, camera, pose, now)
         considerPhoto(rec, frame, camera, pose, now)
@@ -299,6 +327,9 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
                 cameraZ = pose[14],
                 headingRadians = atan2(-pose[10], -pose[8]),
                 photoPositions = synchronized(rec.photoPositions) { rec.photoPositions.toFloatArray() },
+                path = synchronized(rec.path) {
+                    FloatArray(rec.path.size * 2) { i -> rec.path[i / 2][if (i % 2 == 0) 0 else 2] }
+                },
             )
             publish(now, tracking, rec, snapshot, force = true)
         } else {
@@ -335,18 +366,28 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
     }
 
     /**
-     * ≤ 5/s, only after moving 4 cm or turning 0.06 rad, and only depth computed for this very frame
-     * (ARCore reprojects older depth in between), so the record's pose and RGB are the depth's own.
+     * ≤ 5/s, only after moving 4 cm or turning 0.06 rad, and only a depth image ARCore computed anew
+     * (its timestamp differs from the last one seen). Raw depth lags the camera, so the record takes
+     * the pose of the frame with the depth's timestamp from [PoseRing] (or the nearest within 50 ms,
+     * flagged), and the color image only when the depth belongs to the current frame. Every outcome
+     * is counted in [DepthStats].
      */
     private fun considerDepth(rec: Recording, frame: Frame, camera: Camera, pose: FloatArray, now: Long) {
-        if (info?.depthEnabled != true || rec.depthInFlight.get() >= MAX_IN_FLIGHT) return
+        if (info?.depthEnabled != true) return
+        if (rec.depthInFlight.get() >= MAX_IN_FLIGHT) {
+            rec.depthStats.count(DepthStats.BUSY)
+            return
+        }
         if (now - rec.lastDepthNanos < SECOND / 5) return
         rec.lastDepthPose?.let { if (distance(it, pose) <= 0.04f && angle(it, pose) <= 0.06f) return }
 
-        val copy = acquireDepth(frame, now) ?: return
-        val rgb = acquireImage(frame)
+        val acquired = acquireDepth(rec, frame, now) ?: return
+        val (copy, take) = acquired
+        val match = take.match
+        val depthPose = match.pose
+        val rgb = if (take.sameFrame) acquireImage(frame) else null
         rec.lastDepthNanos = now
-        rec.lastDepthPose = pose
+        rec.lastDepthPose = depthPose
         rec.depthWidth = copy.width
         rec.depthHeight = copy.height
 
@@ -357,28 +398,34 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
         val (tw, th) = texture.imageDimensions
         val sx = copy.width.toFloat() / tw
         val sy = copy.height.toFloat() / th
-        val view = CoverageGrid.View(pose, tfx * sx, tfy * sy, tcx * sx, tcy * sy, copy.width, copy.height)
+        val view = CoverageGrid.View(depthPose, tfx * sx, tfy * sy, tcx * sx, tcy * sy, copy.width, copy.height)
         val imageK = imageIntrinsics(camera)
+        val depthSeconds = match.frameNanos / 1e9
 
         val name = String.format(Locale.ROOT, "%05d", rec.nextDepth++)
         val base = DepthFrameRecord(
             arcore = ArcoreDepthInfo(
-                depthTimestamp = now / 1e9,
+                depthTimestamp = (match.frameNanos + match.offsetNanos) / 1e9,
+                frameTimestamp = now / 1e9,
+                poseOffsetMs = if (match.source == PoseSource.NEAREST) match.offsetNanos / 1e6 else null,
+                poseSource = match.source.key,
                 textureHeight = th,
                 textureIntrinsics = Matrices.intrinsics(tfx, tfy, tcx, tcy),
                 textureWidth = tw,
             ),
-            camera = cameraState(frame),
+            // exposure/ISO belong to the current frame: only kept when the depth is that frame's
+            camera = if (take.sameFrame) cameraState(frame) else null,
             confidence = "depth/$name.conf",
             file = "depth/$name.f16z",
             height = copy.height,
             intrinsics = Matrices.intrinsics(tfx * sx, tfy * sy, tcx * sx, tcy * sy),
             room = ScanBundle.ROOM_INDEX,
             segment = rec.segment,
-            timestamp = now / 1e9,
-            transform = pose.toList(),
+            timestamp = depthSeconds,
+            transform = depthPose.toList(),
             width = copy.width,
         )
+        val poseKey = "pose:${match.source.key}"
         rec.depthInFlight.incrementAndGet()
         writer.execute {
             try {
@@ -395,8 +442,14 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
                     rec.grid.addDepth(copy, view)
                     rec.depth.add(record)
                     rec.depthCount.incrementAndGet()
+                    rec.depthStats.count(DepthStats.WRITTEN)
+                    rec.depthStats.count(poseKey)
+                    if (rec.depthStats.firstWrittenSeconds == null) {
+                        rec.depthStats.firstWrittenSeconds = Math.round(rec.elapsedSeconds * 10) / 10.0
+                    }
                 }
             } catch (e: Exception) {
+                rec.depthStats.count(DepthStats.exceptionKey("writeFailed", e))
                 Log.w(TAG, "Depth frame ${base.file} not written", e)
             } finally {
                 rec.depthInFlight.decrementAndGet()
@@ -551,10 +604,20 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
                     ),
                     depthHeight = rec.depthHeight,
                     depthMode = if (it.depthEnabled) "RAW_DEPTH_ONLY" else "DISABLED",
+                    depthStats = if (it.depthEnabled) {
+                        DepthStatsInfo(
+                            firstWrittenSeconds = rec.depthStats.firstWrittenSeconds,
+                            lastUnmatchedOffsetMs = rec.depthStats.lastUnmatchedOffsetMs,
+                            outcomes = rec.depthStats.snapshot(),
+                        )
+                    } else {
+                        null
+                    },
                     depthWidth = rec.depthWidth,
                     events = synchronized(rec.events) { rec.events.toList() },
                     segments = rec.segment + 1,
                     thermal = THERMAL_NAMES.getOrElse(rec.thermal) { "unknown" },
+                    trackingLostSeconds = Math.round(rec.trackingLostSeconds * 10) / 10.0,
                 )
             },
             createdAt = rec.createdAt,
@@ -587,6 +650,9 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
                 photos = rec?.photoCount?.get() ?: it.photos,
                 manualPhotos = rec?.manualCount?.get() ?: it.manualPhotos,
                 depthFrames = rec?.depthCount?.get() ?: it.depthFrames,
+                depthProblem = if (rec != null) DepthStats.describe(rec.depthStats.topProblem()) else it.depthProblem,
+                depthStalled = rec != null && info?.depthEnabled == true && rec.trackedSinceDepth > DEPTH_STALL_SECONDS,
+                trackingLostSeconds = rec?.trackingLostSeconds?.toInt() ?: it.trackingLostSeconds,
                 planes = planeCount,
                 coverage = rec?.grid?.coverage ?: it.coverage,
                 elapsedSeconds = rec?.elapsedSeconds?.toInt() ?: it.elapsedSeconds,
@@ -601,34 +667,53 @@ class CaptureController(context: Context) : CaptureContract, ArSessionHost.Liste
             val reason = camera.trackingFailureReason
             "limited:${reason.name}" to when (reason) {
                 TrackingFailureReason.INSUFFICIENT_LIGHT -> "Too dark: turn on more lights"
-                TrackingFailureReason.EXCESSIVE_MOTION -> "Moving too fast: slow down"
-                TrackingFailureReason.INSUFFICIENT_FEATURES -> "Aim at something with more detail"
-                TrackingFailureReason.CAMERA_UNAVAILABLE -> "Camera unavailable"
-                else -> "Move the phone slowly to start tracking"
+                TrackingFailureReason.EXCESSIVE_MOTION -> "Move slower"
+                TrackingFailureReason.INSUFFICIENT_FEATURES -> "Point at something with texture (not a blank wall)"
+                TrackingFailureReason.CAMERA_UNAVAILABLE -> "Camera unavailable: close other camera apps"
+                else -> "Move the phone slowly from side to side to start tracking"
             }
         }
-        else -> "notAvailable" to "Tracking stopped"
+        else -> "notAvailable" to "Tracking lost: go back to where it last worked and move slowly"
     }
 
     /**
-     * Raw depth + confidence copied out of ARCore, only when the depth image was computed for this
-     * frame (its timestamp equals the frame's); null when unavailable or merely reprojected.
+     * Raw depth + confidence copied out of ARCore when the depth image is new and a pose for its
+     * timestamp is known; otherwise null, with the reason counted in the recording's [DepthStats].
      */
-    private fun acquireDepth(frame: Frame, frameNanos: Long): DepthCopy? {
+    private fun acquireDepth(rec: Recording, frame: Frame, frameNanos: Long): Pair<DepthCopy, DepthDecision.Take>? {
+        val stats = rec.depthStats
         val depthImage = try {
             frame.acquireRawDepthImage16Bits()
         } catch (e: Exception) {
-            return null // NotYetAvailable: no tracked features yet
+            // NotYetAvailable (too little motion or too early), NotTracking, ResourceExhausted, …
+            stats.count(DepthStats.exceptionKey("acquire", e))
+            return null
         }
         try {
-            if (depthImage.timestamp != frameNanos) return null
+            val depthNanos = depthImage.timestamp
+            val decision = DepthPairing.decide(depthNanos, rec.lastDepthImageNanos, frameNanos, rec.poseRing)
+            rec.lastDepthImageNanos = depthNanos
+            if (decision is DepthDecision.Stale) {
+                stats.count(DepthStats.STALE)
+                return null
+            }
+            if (decision is DepthDecision.NoPose) {
+                stats.count(DepthStats.NO_POSE)
+                stats.lastUnmatchedOffsetMs = decision.offsetNanos?.let { it / 1e6 }
+                return null
+            }
+            val take = decision as DepthDecision.Take
             val confidenceImage = try {
                 frame.acquireRawDepthConfidenceImage()
             } catch (e: Exception) {
+                stats.count(DepthStats.exceptionKey("confidence", e))
                 return null
             }
             try {
-                return DepthCopy.of(depthImage, confidenceImage)
+                return Pair(DepthCopy.of(depthImage, confidenceImage), take)
+            } catch (e: Exception) {
+                stats.count(DepthStats.exceptionKey("copy", e))
+                return null
             } finally {
                 confidenceImage.close()
             }
